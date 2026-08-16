@@ -28,7 +28,8 @@ pub use permanent_password::{
 };
 use permanent_password::{
     decode_permanent_password_h1_from_hashed_storage, decrypt_permanent_password_str_or_original,
-    encode_permanent_password_encrypted_storage_from_h1, password_is_empty_or_not_hashed,
+    encode_permanent_password_encrypted_storage_from_h1,
+    local_permanent_password_storage_matches_plain, password_is_empty_or_not_hashed,
     preset_permanent_password_storage_matches_plain, DEFAULT_SALT_LEN, PASSWORD_ENC_VERSION,
 };
 
@@ -73,7 +74,18 @@ lazy_static::lazy_static! {
     static ref KEY_PAIR: Mutex<Option<KeyPair>> = Default::default();
     static ref USER_DEFAULT_CONFIG: RwLock<(UserDefaultConfig, Instant)> = RwLock::new((UserDefaultConfig::load(), Instant::now()));
     pub static ref NEW_STORED_PEER_CONFIG: Mutex<HashSet<String>> = Default::default();
-    pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
+    pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = {
+        let mut m: HashMap<String, String> = HashMap::new();
+        // ITStore: the technician configures these machines over a remote session, and the
+        // home/settings UI is masked out (grey, click-through disabled) for the remote side
+        // unless this is on. Seeded as a DEFAULT, not an overwrite, so the customer can still
+        // turn it off in Settings > Security.
+        m.insert(
+            keys::OPTION_ALLOW_REMOTE_CONFIG_MODIFICATION.to_owned(),
+            "Y".to_owned(),
+        );
+        RwLock::new(m)
+    };
     pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
     pub static ref DEFAULT_DISPLAY_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
     pub static ref OVERWRITE_DISPLAY_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
@@ -83,6 +95,17 @@ lazy_static::lazy_static! {
         let mut m: HashMap<String, String> = HashMap::new();
         if let Some(ct) = option_env!("ITSTORE_CONN_TYPE") {
             if !ct.is_empty() { m.insert("conn-type".to_owned(), ct.to_owned()); }
+        }
+        // ITStore: build-time preset permanent password, so a fresh install is reachable
+        // unattended without the customer setting anything. The value is the *storage*
+        // form ("00" + base64(sha256(password + salt))), never the plaintext -- see
+        // client/make-preset-password.py in the remoteDesktop repo. A local password set
+        // on the machine always takes priority over this (see is_using_preset_password).
+        if let Some(pw) = option_env!("ITSTORE_PRESET_PASSWORD") {
+            if !pw.is_empty() { m.insert("password".to_owned(), pw.to_owned()); }
+        }
+        if let Some(salt) = option_env!("ITSTORE_PRESET_SALT") {
+            if !salt.is_empty() { m.insert("salt".to_owned(), salt.to_owned()); }
         }
         RwLock::new(m)
     };
@@ -1411,6 +1434,27 @@ impl Config {
     fn has_usable_preset_password() -> bool {
         let (preset_storage, preset_salt) = Self::get_preset_password_storage_and_salt();
         preset_permanent_password_storage_is_usable_for_auth(&preset_storage, &preset_salt)
+    }
+
+    /// ITStore: checks `password` against the *effective* permanent password -- the local
+    /// one when the machine has one, otherwise the build-time preset. Used to gate changing
+    /// or removing the permanent password, so a customer must prove they know the current
+    /// one first. Returns false when nothing usable is set, which keeps the gate closed
+    /// rather than open on a machine with no password at all.
+    pub fn verify_permanent_password(password: &str) -> bool {
+        if password.is_empty() {
+            return false;
+        }
+        let (local_storage, local_salt) = Self::get_local_permanent_password_storage_and_salt();
+        if !local_storage.is_empty() {
+            return local_permanent_password_storage_matches_plain(
+                &local_storage,
+                &local_salt,
+                password,
+            );
+        }
+        let (preset_storage, preset_salt) = Self::get_preset_password_storage_and_salt();
+        preset_permanent_password_storage_matches_plain(&preset_storage, &preset_salt, password)
     }
 
     pub fn is_using_preset_password() -> bool {
